@@ -1,0 +1,167 @@
+name: Cleanup Workflows
+
+on:
+  workflow_dispatch:
+    inputs:
+      delete_workflow_runs:
+        description: "Delete all workflow runs"
+        required: false
+        type: boolean
+        default: true
+      delete_artifacts:
+        description: "Delete all workflow artifacts"
+        required: false
+        type: boolean
+        default: true
+      delete_caches:
+        description: "Delete all workflow caches"
+        required: false
+        type: boolean
+        default: true
+      delete_draft_releases:
+        description: "Delete all draft releases"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  actions: write
+  repository-projects: write
+
+jobs:
+  cleanup:
+    name: Cleanup Workflows
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Delete workflow runs
+        if: inputs.delete_workflow_runs == true
+        run: |
+          echo "Fetching all workflow runs..."
+          
+          # Get all workflows
+          workflows=$(curl -s -H "Authorization: token ${{ github.token }}" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows" | \
+            jq -r '.workflows[].id')
+          
+          for workflow_id in $workflows; do
+            echo "Processing workflow ID: $workflow_id"
+            
+            # Get all runs for this workflow
+            page=1
+            while true; do
+              runs=$(curl -s -H "Authorization: token ${{ github.token }}" \
+                "https://api.github.com/repos/${{ github.repository }}/actions/workflows/$workflow_id/runs?per_page=100&page=$page" | \
+                jq -r '.workflow_runs[].id')
+              
+              if [ -z "$runs" ]; then
+                break
+              fi
+              
+              for run_id in $runs; do
+                echo "Deleting workflow run: $run_id"
+                curl -X DELETE -s -H "Authorization: token ${{ github.token }}" \
+                  "https://api.github.com/repos/${{ github.repository }}/actions/runs/$run_id" || true
+              done
+              
+              page=$((page + 1))
+            done
+          done
+          
+          echo "Workflow runs cleanup completed"
+
+      - name: Delete workflow artifacts
+        if: inputs.delete_artifacts == true
+        run: |
+          echo "Fetching all artifacts..."
+          
+          page=1
+          while true; do
+            artifacts=$(curl -s -H "Authorization: token ${{ github.token }}" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/artifacts?per_page=100&page=$page" | \
+              jq -r '.artifacts[].id')
+            
+            if [ -z "$artifacts" ]; then
+              break
+            fi
+            
+            for artifact_id in $artifacts; do
+              echo "Deleting artifact: $artifact_id"
+              curl -X DELETE -s -H "Authorization: token ${{ github.token }}" \
+                "https://api.github.com/repos/${{ github.repository }}/actions/artifacts/$artifact_id" || true
+            done
+            
+            page=$((page + 1))
+          done
+          
+          echo "Artifacts cleanup completed"
+
+      - name: Delete workflow caches
+        if: inputs.delete_caches == true
+        run: |
+          echo "Fetching all caches..."
+          
+          page=1
+          while true; do
+            caches=$(curl -s -H "Authorization: token ${{ github.token }}" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/caches?per_page=100&page=$page" | \
+              jq -r '.actions_caches[].id')
+            
+            if [ -z "$caches" ]; then
+              break
+            fi
+            
+            for cache_id in $caches; do
+              echo "Deleting cache: $cache_id"
+              curl -X DELETE -s -H "Authorization: token ${{ github.token }}" \
+                "https://api.github.com/repos/${{ github.repository }}/actions/caches/$cache_id" || true
+            done
+            
+            page=$((page + 1))
+          done
+          
+          echo "Caches cleanup completed"
+
+      - name: Delete draft releases
+        if: inputs.delete_draft_releases == true
+        run: |
+          echo "Fetching all draft releases..."
+          
+          page=1
+          while true; do
+            releases=$(curl -s -H "Authorization: token ${{ github.token }}" \
+              "https://api.github.com/repos/${{ github.repository }}/releases?per_page=100&page=$page" | \
+              jq -r '.[] | select(.draft == true) | .id')
+            
+            if [ -z "$releases" ]; then
+              break
+            fi
+            
+            for release_id in $releases; do
+              echo "Deleting draft release ID: $release_id"
+              curl -X DELETE -s -H "Authorization: token ${{ github.token }}" \
+                "https://api.github.com/repos/${{ github.repository }}/releases/$release_id" || true
+            done
+            
+            page=$((page + 1))
+          done
+          
+          echo "Draft releases cleanup completed"
+
+      - name: Summary
+        run: |
+          echo "::notice::Cleanup completed successfully!"
+          echo "::notice::Deleted items:"
+          if [ "${{ inputs.delete_workflow_runs }}" == "true" ]; then
+            echo "::notice::- Workflow runs"
+          fi
+          if [ "${{ inputs.delete_artifacts }}" == "true" ]; then
+            echo "::notice::- Artifacts"
+          fi
+          if [ "${{ inputs.delete_caches }}" == "true" ]; then
+            echo "::notice::- Caches"
+          fi
+          if [ "${{ inputs.delete_draft_releases }}" == "true" ]; then
+            echo "::notice::- Draft releases"
+          fi

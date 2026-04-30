@@ -1,0 +1,248 @@
+name: Build IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      ipa_url:
+        description: "URL to the decrypted IPA file"
+        required: true
+        type: string
+
+      deb_urls:
+        description: "DEB packages to inject — comma-separated direct .deb URLs and/or URLs to .zip archives containing .deb files"
+        required: true
+        type: string
+
+      sdk_version:
+        description: "iOS SDK version (Theos)"
+        type: choice
+        options:
+          - 16.5
+          - 17.5
+          - 18.6
+        required: true
+        default: 16.5
+
+      display_name:
+        description: "Display name for the signed app (-n). Leave empty to use the IPA Info.plist value."
+        required: false
+        default: ""
+        type: string
+
+      bundle_id:
+        description: "Bundle identifier (-b). Leave empty to use the IPA Info.plist value."
+        required: false
+        default: ""
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Inject DEBs into IPA
+    runs-on: macos-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4.1.1
+        with:
+          submodules: recursive
+
+      - name: Hide sensitive inputs
+        uses: levibostian/action-hide-sensitive-inputs@v1
+        with:
+          exclude_inputs: bundle_id,display_name,sdk_version
+
+      - name: Get tool commit hashes
+        id: commits
+        uses: ./.github/actions/get-commits
+
+      - name: Install dependencies
+        run: brew install make ldid
+
+      - name: Set GNU make PATH environment variable
+        run: echo "$(brew --prefix make)/libexec/gnubin" >> $GITHUB_PATH
+
+      - name: Cache Theos
+        id: theos
+        uses: ./.github/actions/cache-theos
+        with:
+          sdk_version: ${{ inputs.sdk_version }}
+          theos_commit: ${{ steps.tool_commits.outputs.theos }}
+
+      - name: Download iOS 16.5 SDK
+        if: inputs.sdk_version == 16.5 && steps.theos.outputs.cache-hit != 'true'
+        uses: ./.github/actions/download-sdk-16.5
+        with:
+          theos_path: ${{ github.workspace }}/theos
+
+      - name: Download iOS 17.5 SDK
+        if: inputs.sdk_version == 17.5 && steps.theos.outputs.cache-hit != 'true'
+        uses: ./.github/actions/download-sdk-17.5
+        with:
+          theos_path: ${{ github.workspace }}/theos
+
+      - name: Download iOS 18.6 SDK
+        if: inputs.sdk_version == 18.6 && steps.theos.outputs.cache-hit != 'true'
+        uses: ./.github/actions/download-sdk-18.6
+        with:
+          theos_path: ${{ github.workspace }}/theos
+
+      - name: Cache Cyan
+        id: cache_cyan
+        uses: ./.github/actions/cache-cyan
+        with:
+          cyan_commit: ${{ steps.tool_commits.outputs.cyan }}
+
+      - name: Download and validate IPA
+        run: |
+          wget "${{ inputs.ipa_url }}" --no-verbose -O ${{ github.workspace }}/app.ipa
+
+          file_type=$(file --mime-type -b ${{ github.workspace }}/app.ipa)
+
+          if [[ "$file_type" != "application/x-ios-app" && "$file_type" != "application/zip" ]]; then
+            echo "::error::Validation failed: The downloaded file is not a valid IPA. Detected type: $file_type."
+            exit 1
+          fi
+
+      - name: Extract app metadata from IPA
+        id: app_meta
+        env:
+          DISPLAY_IN: ${{ inputs.display_name }}
+          BUNDLE_IN: ${{ inputs.bundle_id }}
+        run: |
+          IPA="${{ github.workspace }}/app.ipa"
+          INFO_PLIST=$(unzip -l "$IPA" | grep -o "Payload/[^/]*\.app/Info\.plist" | head -n 1)
+          if [ -z "$INFO_PLIST" ]; then
+            echo "::error::Could not find Info.plist in IPA"
+            exit 1
+          fi
+
+          mkdir -p ${{ github.workspace }}/ipa_extract
+          unzip -p "$IPA" "$INFO_PLIST" > ${{ github.workspace }}/ipa_extract/Info.plist
+
+          PLIST="${{ github.workspace }}/ipa_extract/Info.plist"
+          APP_VERSION=$(plutil -p "$PLIST" 2>/dev/null | grep "CFBundleShortVersionString" | sed -E 's/.*"CFBundleShortVersionString"[[:space:]]*=>[[:space:]]*"([^"]+)".*/\1/')
+          if [ -z "$APP_VERSION" ]; then
+            echo "::error::Could not extract CFBundleShortVersionString from Info.plist"
+            exit 1
+          fi
+          echo "App version: $APP_VERSION"
+          echo "version=$APP_VERSION" >> $GITHUB_OUTPUT
+
+          if [ -n "$DISPLAY_IN" ]; then
+            echo "display_name=$DISPLAY_IN" >> $GITHUB_OUTPUT
+          else
+            DN=$(plutil -extract CFBundleDisplayName raw "$PLIST" 2>/dev/null || true)
+            if [ -z "$DN" ] || [ "$DN" = "null" ]; then
+              DN=$(plutil -extract CFBundleName raw "$PLIST" 2>/dev/null || true)
+            fi
+            if [ -z "$DN" ] || [ "$DN" = "null" ]; then
+              echo "::error::display_name input is empty and IPA has no CFBundleDisplayName / CFBundleName"
+              exit 1
+            fi
+            echo "display_name=$DN" >> $GITHUB_OUTPUT
+          fi
+
+          if [ -n "$BUNDLE_IN" ]; then
+            echo "bundle_id=$BUNDLE_IN" >> $GITHUB_OUTPUT
+          else
+            BID=$(plutil -extract CFBundleIdentifier raw "$PLIST" 2>/dev/null || true)
+            if [ -z "$BID" ] || [ "$BID" = "null" ]; then
+              echo "::error::bundle_id input is empty and IPA has no CFBundleIdentifier"
+              exit 1
+            fi
+            echo "bundle_id=$BID" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Download DEB(s)
+        run: |
+          cd ${{ github.workspace }}
+          temp_root=$(mktemp -d)
+          trap "rm -rf $temp_root" EXIT
+
+          IFS=',' read -ra URL_ARRAY <<< "${{ inputs.deb_urls }}"
+
+          for url in "${URL_ARRAY[@]}"; do
+            url=$(echo "$url" | xargs)
+            [ -z "$url" ] && continue
+
+            filename=$(basename "$url" | sed 's/[?#].*$//')
+            [ -z "$filename" ] && filename="download_$(date +%s%N).tmp"
+
+            echo "Downloading: $filename"
+            if ! wget "$url" --quiet -O "$filename"; then
+              echo "::error::Failed to download: $url"
+              exit 1
+            fi
+
+            file_type=$(file --mime-type -b "$filename")
+
+            if [[ "$file_type" =~ ^application/(zip|x-zip-compressed)$ ]] || [[ "$filename" =~ \.zip$ ]]; then
+              temp_dir=$(mktemp -d "$temp_root/unzip.XXXXXX")
+              echo "Extracting ZIP: $filename"
+              if ! unzip -q "$filename" -d "$temp_dir"; then
+                echo "::error::Failed to extract ZIP: $filename"
+                exit 1
+              fi
+              deb_count=0
+              while IFS= read -r -d '' deb_file; do
+                base=$(basename "$deb_file")
+                cp "$deb_file" "$base"
+                echo "  extracted: $base"
+                deb_count=$((deb_count + 1))
+              done < <(find "$temp_dir" -type f -name "*.deb" -print0)
+              if [ "$deb_count" -eq 0 ]; then
+                echo "::error::No .deb files inside ZIP: $filename"
+                exit 1
+              fi
+              rm -f "$filename"
+
+            elif [[ "$file_type" =~ ^application/(vnd\.debian\.binary-package|x-deb|x-debian-package)$ ]] || [[ "$filename" =~ \.deb$ ]]; then
+              [[ ! "$filename" =~ \.deb$ ]] && mv "$filename" "${filename%.*}.deb" && filename="${filename%.*}.deb"
+              echo "ok: $filename"
+            else
+              echo "::error::Not a .deb or .zip: $filename (type $file_type)"
+              exit 1
+            fi
+          done
+
+          deb_total=$(find . -maxdepth 1 -type f -name "*.deb" | wc -l | tr -d ' ')
+          if [ "$deb_total" -eq 0 ]; then
+            echo "::error::No .deb files in workspace after processing deb_urls"
+            exit 1
+          fi
+          echo "DEBs to inject:"
+          ls -1 *.deb | sed 's/^/  - /'
+
+      - name: Inject tweaks into IPA
+        id: out_ipa
+        env:
+          DISPLAY_NAME: ${{ steps.app_meta.outputs.display_name }}
+          BUNDLE_ID: ${{ steps.app_meta.outputs.bundle_id }}
+        run: |
+          cd ${{ github.workspace }}
+          tweaks=""
+          for f in *.deb; do
+            [ -f "$f" ] && tweaks="$tweaks $f"
+          done
+          tweaks=$(echo "$tweaks" | xargs)
+          OUT="Injected_SDK${{ inputs.sdk_version }}_v${{ steps.app_meta.outputs.version }}_${{ github.run_number }}.ipa"
+          echo "path=$OUT" >> $GITHUB_OUTPUT
+          cyan -i app.ipa -o "$OUT" -uwef $tweaks -n "$DISPLAY_NAME" -b "$BUNDLE_ID"
+
+      - name: Upload to GitHub Releases
+        uses: softprops/action-gh-release@v2.0.1
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Injected SDK${{ inputs.sdk_version }} v${{ steps.app_meta.outputs.version }} (${{ github.run_number }})
+          files: ${{ steps.out_ipa.outputs.path }}
+          draft: true
+
+      - name: Output Release URL
+        run: |
+          echo "::notice::Release available at: https://github.com/${{ github.repository }}/releases"

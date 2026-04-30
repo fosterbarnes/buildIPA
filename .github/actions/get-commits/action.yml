@@ -1,0 +1,29 @@
+name: 'Get Cyan/Theoscommit hashes'
+description: 'Resolve HEAD commit short hashes for Cyan (pyzule-rw) and Theos caches'
+
+outputs:
+  cyan:
+    description: 'Cyan / pyzule-rw commit hash'
+    value: ${{ steps.commits.outputs.cyan }}
+  theos:
+    description: 'Theos commit hash'
+    value: ${{ steps.commits.outputs.theos }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Resolve commits
+      id: commits
+      shell: bash
+      run: |
+        cd "${{ github.workspace }}"
+        get_commit_hash() {
+          local repo_url=$1
+          git ls-remote "$repo_url" HEAD | awk '{print substr($1,1,7)}'
+        }
+        CYAN_COMMIT=$(get_commit_hash "https://github.com/asdfzxcvbn/pyzule-rw.git")
+        echo "cyan=$CYAN_COMMIT" >> "$GITHUB_OUTPUT"
+        echo "Cyan commit: $CYAN_COMMIT"
+        THEOS_COMMIT=$(get_commit_hash "https://github.com/theos/theos.git")
+        echo "theos=$THEOS_COMMIT" >> "$GITHUB_OUTPUT"
+        echo "Theos commit: $THEOS_COMMIT"
